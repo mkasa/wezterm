@@ -1,0 +1,63 @@
+name: mkasa-windows-release
+
+# Fork-only workflow: builds the Windows release binaries for this branch
+# and publishes them as a prerelease on the fork.
+
+on:
+  push:
+    branches:
+      - kitty-shm-wsl-fallback
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: "windows-2025"
+
+    env:
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      RUSTUP_WINDOWS_PATH_ADD_BIN: "1"
+
+    steps:
+      - name: "checkout repo"
+        uses: actions/checkout@v5
+        with:
+          submodules: "recursive"
+      - name: "Install Rust"
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: "x86_64-pc-windows-msvc"
+      - name: "Compile with sccache"
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: "Build (Release mode)"
+        shell: cmd
+        run: |
+          PATH C:\Strawberry\perl\bin;%PATH%
+          cargo build --release -p wezterm -p wezterm-gui -p wezterm-mux-server -p strip-ansi-escapes
+      - name: "Package"
+        shell: bash
+        run: "bash ci/deploy.sh"
+      - name: "Upload artifact"
+        uses: actions/upload-artifact@v7
+        with:
+          name: "windows"
+          path: |
+            WezTerm-*.zip
+            WezTerm-*.exe
+      - name: "Publish prerelease"
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="mkasa-$(git -c core.abbrev=8 show -s --format=%cd-%h --date=format:%Y%m%d-%H%M%S)"
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "WezTerm Windows build ($GITHUB_REF_NAME @ ${GITHUB_SHA::8})" \
+            --notes "Unofficial test build of branch \`$GITHUB_REF_NAME\`: kitty graphics unicode placeholders (wezterm/wezterm#7924) plus the WSL2 /dev/shm fallback for t=s." \
+            WezTerm-*.zip WezTerm-*.exe
