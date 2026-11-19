@@ -359,7 +359,124 @@ mod win {
             .collect()
     }
 
+    /// Lists the WSL distributions that are currently running.
+    /// Only running ones are considered, because touching
+    /// `\\wsl.localhost\<distro>` would start a stopped distribution.
+    fn running_wsl_distros() -> Vec<String> {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let output = match std::process::Command::new("wsl.exe")
+            .args(["--list", "--quiet", "--running"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        {
+            Ok(output) if output.status.success() => output,
+            _ => return vec![],
+        };
+        // wsl.exe emits UTF-16LE
+        let wide: Vec<u16> = output
+            .stdout
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&wide)
+            .lines()
+            .map(|l| l.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}'))
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .collect()
+    }
+
+    /// Fallback for clients running inside WSL2: their POSIX shared memory
+    /// objects live in the /dev/shm of the Linux VM, which Windows can reach
+    /// as a regular file via the `\\wsl.localhost\<distro>` 9P share.
+    fn read_wsl_shared_memory_data(
+        name: &str,
+        data_offset: Option<u32>,
+        data_size: Option<u32>,
+    ) -> std::result::Result<std::vec::Vec<u8>, std::io::Error> {
+        use std::io::{Read, Seek};
+        use std::sync::Mutex;
+
+        static DISTROS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+        let name = name.trim_start_matches('/');
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains(|c: char| matches!(c, '/' | '\\' | ':' | '\0'))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid shm name {name:?}"),
+            ));
+        }
+
+        let try_distros = |distros: &[String]| -> Option<std::io::Result<Vec<u8>>> {
+            for distro in distros {
+                let path = format!(r"\\wsl.localhost\{distro}\dev\shm\{name}");
+                let mut file = match std::fs::File::open(&path) {
+                    Ok(file) => file,
+                    Err(_) => continue,
+                };
+                let read = (|| {
+                    if let Some(offset) = data_offset {
+                        file.seek(std::io::SeekFrom::Start(offset.into()))?;
+                    }
+                    let mut data = vec![];
+                    match data_size {
+                        Some(size) => {
+                            (&mut file).take(size.into()).read_to_end(&mut data)?;
+                        }
+                        None => {
+                            file.read_to_end(&mut data)?;
+                        }
+                    }
+                    Ok(data)
+                })();
+                drop(file);
+                // Equivalent of shm_unlink()
+                if let Err(err) = std::fs::remove_file(&path) {
+                    log::warn!("Unable to remove WSL shared memory object {path}: {err:#}");
+                }
+                return Some(read);
+            }
+            None
+        };
+
+        let mut distros = DISTROS.lock().unwrap();
+        if let Some(result) = try_distros(&distros) {
+            return result;
+        }
+        // Not found in the cached set; the set of running distros may have changed
+        *distros = running_wsl_distros();
+        if let Some(result) = try_distros(&distros) {
+            return result;
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{name} not found in /dev/shm of any running WSL distribution"),
+        ))
+    }
+
     pub fn read_shared_memory_data(
+        name: &str,
+        data_offset: Option<u32>,
+        data_size: Option<u32>,
+    ) -> std::result::Result<std::vec::Vec<u8>, std::io::Error> {
+        match read_file_mapping_data(name, data_offset, data_size) {
+            Ok(data) => Ok(data),
+            Err(mapping_err) => read_wsl_shared_memory_data(name, data_offset, data_size)
+                .map_err(|wsl_err| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("{mapping_err:#}; WSL fallback: {wsl_err:#}"),
+                    )
+                }),
+        }
+    }
+
+    fn read_file_mapping_data(
         name: &str,
         data_offset: Option<u32>,
         data_size: Option<u32>,
